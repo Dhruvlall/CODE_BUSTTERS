@@ -1,0 +1,288 @@
+"use client";
+// The home page and the "brain" of the UI.
+// Runs in the BROWSER ("use client"), because it uses state, events and IndexedDB.
+//
+// Data flow:
+//   FeedForm → requestFeed() → lib/feed-client.ts → GET /api/feed → FeedList
+//   Save button → lib/db.ts (IndexedDB) → SavedArticles
+//   Every loaded feed → lib/db.ts cacheFeed() → shown again when offline / on next visit
+
+import { useEffect, useEffectEvent, useRef, useState } from "react";
+import Link from "next/link";
+import { Radar as RadarIcon, Rss, ShieldCheck } from "lucide-react";
+import { AIWorkspace } from "@/components/AIWorkspace";
+import { EmptyState } from "@/components/EmptyState";
+import { FeedForm } from "@/components/FeedForm";
+import { LocalAiProvider } from "@/components/LocalAiProvider";
+import { FeedList, FeedListSkeleton, formatDateTime } from "@/components/FeedList";
+import { OfflineCopies } from "@/components/OfflineCopies";
+import { OfflineIndicator } from "@/components/OfflineIndicator";
+import { ReaderView } from "@/components/ReaderView";
+import { SavedArticles } from "@/components/SavedArticles";
+import { StatusMessage, type StatusKind } from "@/components/StatusMessage";
+import {
+  cacheFeed,
+  clearOfflineCopies as clearOfflineCopiesInDb,
+  countCachedFeeds,
+  countExtractedArticles,
+  getCachedFeed,
+  getLatestCachedFeed,
+  getSavedArticles,
+  removeSavedArticle,
+  saveArticle,
+} from "@/lib/db";
+import { loadFeed } from "@/lib/feed-client";
+import type { CachedFeed, FeedInfo, FeedItem, ReadableArticle, SavedArticle } from "@/lib/feed-types";
+
+// `retryUrl` is set when trying the same URL again might help.
+type Status = { kind: StatusKind; message: string; retryUrl?: string } | null;
+
+/** The feed on screen. `cachedAt` is set when it is an offline copy. */
+type ShownFeed = { info: FeedInfo; items: FeedItem[]; cachedAt?: string };
+
+export default function HomePage() {
+  const [feed, setFeed] = useState<ShownFeed | null>(null);
+  const [isLoadingFeed, setIsLoadingFeed] = useState(false);
+  const [status, setStatus] = useState<Status>(null);
+
+  // Saved articles from IndexedDB.
+  const [saved, setSaved] = useState<SavedArticle[]>([]);
+  const [isLoadingSaved, setIsLoadingSaved] = useState(true);
+  const [savedError, setSavedError] = useState<string | null>(null);
+
+  // Offline feed copies in IndexedDB.
+  const [cachedCount, setCachedCount] = useState(0);
+  const [storedArticleCount, setStoredArticleCount] = useState(0);
+  const [isClearingCache, setIsClearingCache] = useState(false);
+
+  // The article open in the reading view (null = closed).
+  const [readingArticle, setReadingArticle] = useState<ReadableArticle | null>(null);
+
+  // The request in progress, so a newer request (or leaving the page) can cancel it.
+  const activeRequest = useRef<AbortController | null>(null);
+  useEffect(() => () => activeRequest.current?.abort(), []);
+
+  // When the page opens: load saved articles, show the last offline copy
+  // instantly, then (if online) check for new articles in the background.
+  // State is only set inside promise callbacks (after the effect has run).
+  const onLatestCachedFeed = useEffectEvent((latest: CachedFeed | undefined) => {
+    if (!latest) return;
+    showCachedFeed(latest, navigator.onLine ? "Checking for new articles…" : "You are offline.");
+    if (navigator.onLine) void requestFeed(latest.requestedUrl, { background: true });
+  });
+  useEffect(() => {
+    getSavedArticles()
+      .then(setSaved)
+      .catch((error: Error) => setSavedError(error.message))
+      .finally(() => setIsLoadingSaved(false));
+    // Storage problems here are already reported by the saved-articles section.
+    countCachedFeeds().then(setCachedCount).catch(() => {});
+    countExtractedArticles().then(setStoredArticleCount).catch(() => {});
+    getLatestCachedFeed().then(onLatestCachedFeed).catch(() => {});
+  }, []);
+
+  function showCachedFeed(cached: CachedFeed, prefix: string, retryUrl?: string) {
+    setFeed({ info: cached.feed, items: cached.items, cachedAt: cached.cachedAt });
+    setStatus({
+      kind: "info",
+      message: `${prefix} Showing your offline copy from ${formatDateTime(cached.cachedAt)}.`,
+      retryUrl,
+    });
+  }
+
+  /** Shows the offline copy of `url` if there is one. Returns false if there is none. */
+  async function tryOfflineCopy(url: string, prefix: string): Promise<boolean> {
+    const cached = await getCachedFeed(url).catch(() => undefined);
+    if (!cached) return false;
+    showCachedFeed(cached, prefix, url);
+    return true;
+  }
+
+  async function requestFeed(url: string, options: { background?: boolean } = {}) {
+    // navigator.onLine is read directly so this is always the current value.
+    if (!navigator.onLine) {
+      if (await tryOfflineCopy(url, "You are offline.")) return;
+      setStatus({
+        kind: "error",
+        message: "You are offline and this feed has no offline copy yet. Your saved articles are still available.",
+        retryUrl: url,
+      });
+      return;
+    }
+
+    // Cancel any older request so its answer cannot replace this one.
+    activeRequest.current?.abort();
+    const controller = new AbortController();
+    activeRequest.current = controller;
+
+    setIsLoadingFeed(true);
+    if (!options.background) setStatus({ kind: "loading", message: "Loading feed…" });
+
+    const result = await loadFeed(url, { signal: controller.signal });
+    if (controller.signal.aborted) return; // a newer request took over
+
+    activeRequest.current = null;
+    setIsLoadingFeed(false);
+
+    if (result.ok) {
+      setFeed({ info: result.feed, items: result.items });
+      const loaded = `${options.background ? "Updated: " : "Loaded "}${result.items.length} ${
+        result.items.length === 1 ? "article" : "articles"
+      } from ${result.feed.title}.`;
+      setStatus({ kind: "success", message: loaded });
+      try {
+        await cacheFeed(url, result.feed, result.items);
+        setCachedCount(await countCachedFeeds());
+      } catch (error) {
+        // The feed is still shown; only the offline copy failed.
+        if (activeRequest.current) return; // a newer request owns the status message now
+        const reason = error instanceof Error ? error.message : "Local storage failed.";
+        setStatus({ kind: "info", message: `${loaded} An offline copy could not be kept: ${reason}` });
+      }
+      return;
+    }
+
+    // Connection problems (or a failed background update): fall back to the offline copy.
+    const connectionProblem = result.code === "NETWORK_ERROR" || result.code === "CLIENT_TIMEOUT";
+    if ((connectionProblem || options.background) && (await tryOfflineCopy(url, result.message))) return;
+
+    setStatus({ kind: "error", message: result.message, retryUrl: result.retryable ? url : undefined });
+  }
+
+  /** Closing the reader may have stored a new full article, so refresh the count. */
+  function closeReader() {
+    setReadingArticle(null);
+    countExtractedArticles().then(setStoredArticleCount).catch(() => {});
+  }
+
+  async function clearOfflineCopies() {
+    setIsClearingCache(true);
+    try {
+      await clearOfflineCopiesInDb();
+      setCachedCount(0);
+      setStoredArticleCount(await countExtractedArticles()); // full text of saved articles is kept
+      // A copy already on screen stays visible, but is no longer stored.
+      setStatus({ kind: "success", message: "Offline copies were deleted from this device. Saved articles were kept." });
+    } catch (error) {
+      setStatus({ kind: "error", message: error instanceof Error ? error.message : "Could not clear offline copies." });
+    } finally {
+      setIsClearingCache(false);
+    }
+  }
+
+  async function toggleSave(article: ReadableArticle) {
+    const isSaved = saved.some((item) => item.id === article.id);
+    try {
+      if (isSaved) {
+        await removeSavedArticle(article.id);
+        setSaved((current) => current.filter((item) => item.id !== article.id));
+      } else {
+        const savedArticle = await saveArticle(article, article.feedTitle ?? feed?.info.title ?? "Unknown feed");
+        setSaved((current) => [savedArticle, ...current]);
+      }
+      setSavedError(null);
+    } catch (error) {
+      setSavedError(error instanceof Error ? error.message : "Local storage failed.");
+    }
+  }
+
+  const savedIds = new Set(saved.map((item) => item.id));
+  const retryUrl = isLoadingFeed ? undefined : status?.retryUrl;
+
+  return (
+    <LocalAiProvider>
+      <a
+        href="#main"
+        className="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-10 focus:rounded-lg focus:bg-surface focus:px-3 focus:py-2"
+      >
+        Skip to content
+      </a>
+
+      <header className="border-b border-line bg-surface">
+        <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3 px-4 py-4 sm:px-6">
+          <div>
+            <h1 className="flex items-center gap-2 text-xl font-bold tracking-tight text-ink">
+              <span className="grid size-8 place-items-center rounded-lg bg-accent text-white dark:text-bg">
+                <Rss aria-hidden="true" className="size-4" />
+              </span>
+              NOVA Reader
+            </h1>
+            <p className="mt-0.5 text-sm text-ink-muted">A private, offline-friendly reader for independent blogs.</p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Link
+              href="/radar"
+              className="inline-flex min-h-9 items-center gap-1.5 rounded-full border border-line px-3 text-sm font-medium text-ink hover:border-accent hover:text-accent"
+            >
+              <RadarIcon aria-hidden="true" className="size-4" />
+              Knowledge Radar
+            </Link>
+            <OfflineIndicator />
+          </div>
+        </div>
+      </header>
+
+      <main id="main" className="mx-auto grid max-w-6xl gap-8 px-4 py-6 sm:px-6 lg:grid-cols-[minmax(0,1fr)_22rem]">
+        <div className="min-w-0 space-y-4">
+          <FeedForm onSubmit={requestFeed} isLoading={isLoadingFeed} />
+          {status && (
+            <StatusMessage
+              kind={status.kind}
+              message={status.message}
+              action={retryUrl ? { label: "Try again", onClick: () => requestFeed(retryUrl) } : undefined}
+            />
+          )}
+
+          {/* aria-busy only on the results, so the status message above is still announced. */}
+          <div aria-busy={isLoadingFeed}>
+            {isLoadingFeed && !feed ? (
+              <FeedListSkeleton />
+            ) : feed ? (
+              <FeedList
+                feed={feed.info}
+                items={feed.items}
+                savedIds={savedIds}
+                cachedAt={feed.cachedAt}
+                onToggleSave={toggleSave}
+                onRead={setReadingArticle}
+              />
+            ) : (
+              <EmptyState
+                icon={Rss}
+                title="No feed loaded yet"
+                message="Paste a feed URL above, or pick one of the examples, to see its latest articles."
+              />
+            )}
+          </div>
+        </div>
+
+        <aside className="space-y-6" aria-label="Saved articles and planned features">
+          <SavedArticles
+            articles={saved}
+            isLoading={isLoadingSaved}
+            error={savedError}
+            onRemove={toggleSave}
+            onRead={setReadingArticle}
+          />
+          <OfflineCopies
+            count={cachedCount}
+            articleCount={storedArticleCount}
+            onClear={clearOfflineCopies}
+            isClearing={isClearingCache}
+          />
+          <AIWorkspace />
+        </aside>
+      </main>
+
+      <footer className="mx-auto max-w-6xl px-4 pb-8 sm:px-6">
+        <p className="flex items-start gap-2 text-sm text-ink-muted">
+          <ShieldCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+          No accounts, no tracking. Saved articles stay in this browser. Feeds are fetched through this app&apos;s server,
+          which does not store them. Hackathon MVP — not production-ready.
+        </p>
+      </footer>
+
+      <ReaderView article={readingArticle} onClose={closeReader} />
+    </LocalAiProvider>
+  );
+}
